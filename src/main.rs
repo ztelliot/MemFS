@@ -7,6 +7,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     iter,
+    path::Path,
     time::{Duration, SystemTime},
 };
 use sysinfo::System;
@@ -28,8 +29,55 @@ impl Node {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct MemFile {
+    hardlink: u32,
+    data: Vec<u8>,
+}
+
+impl MemFile {
+    pub fn new() -> MemFile {
+        MemFile {
+            hardlink: 1,
+            data: Vec::new(),
+        }
+    }
+
+    pub fn new_data(bytes: Vec<u8>) -> MemFile {
+        MemFile {
+            hardlink: 1,
+            data: bytes,
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.data.len()
+    }
+
+    fn update(&mut self, data: &[u8], offset: usize) -> usize {
+        if self.data.len() <= offset {
+            self.data
+                .extend(iter::repeat(0).take(offset as usize - self.data.len()));
+        }
+
+        if offset + data.len() > self.data.len() {
+            self.data.splice(offset as usize.., data.iter().cloned());
+        } else {
+            self.data
+                .splice(offset..offset + data.len(), data.iter().cloned());
+        }
+
+        data.len()
+    }
+
+    fn truncate(&mut self, size: usize) {
+        self.data.truncate(size);
+    }
+}
+
 pub struct MemFS {
-    files: BTreeMap<Ino, Vec<u8>>,
+    files: BTreeMap<Ino, MemFile>,
+    links: BTreeMap<Ino, Ino>,
     attrs: BTreeMap<Ino, FileAttr>,
     tree: BTreeMap<Ino, Node>,
     next: Ino,
@@ -37,7 +85,8 @@ pub struct MemFS {
 
 impl MemFS {
     pub fn new() -> MemFS {
-        let files: BTreeMap<Ino, Vec<u8>> = BTreeMap::new();
+        let files: BTreeMap<Ino, MemFile> = BTreeMap::new();
+        let links: BTreeMap<Ino, Ino> = BTreeMap::new();
         let mut attrs: BTreeMap<Ino, FileAttr> = BTreeMap::new();
         let mut tree: BTreeMap<Ino, Node> = BTreeMap::new();
         let ts: SystemTime = SystemTime::now();
@@ -64,6 +113,7 @@ impl MemFS {
         tree.insert(1, Node::new(1 as Ino));
         MemFS {
             files,
+            links,
             attrs,
             tree,
             next: 2,
@@ -160,6 +210,27 @@ impl MemFS {
         self.attrs.get(inode).ok_or(ENOENT)
     }
 
+    pub fn lookup_rev(&mut self, parent: Ino, target: &Path) -> Result<Ino, c_int> {
+        let mut inode: Ino = parent;
+        for name in target.iter() {
+            if name == OsStr::new(".") {
+                continue;
+            } else if name == OsStr::new("..") {
+                inode = self.tree.get(&inode).ok_or(ENOENT)?.parent;
+                continue;
+            } else {
+                inode = *self
+                    .tree
+                    .get(&inode)
+                    .ok_or(ENOENT)?
+                    .children
+                    .get(name.to_str().unwrap())
+                    .ok_or(ENOENT)?;
+            }
+        }
+        Ok(inode)
+    }
+
     pub fn rmdir(&mut self, parent: Ino, name: &OsStr) -> Result<(), c_int> {
         let name_str: &str = name.to_str().unwrap();
         let inode: Ino = *self
@@ -227,10 +298,103 @@ impl MemFS {
             .ok_or(ENOENT)?;
         let attr: FileAttr = self.attrs.remove(&inode).ok_or(EINVAL)?;
         if attr.kind == FileType::RegularFile {
-            self.files.remove(&inode);
+            let real_inode = self.links.get(&inode).ok_or(ENOENT)?;
+            let file: &mut MemFile = self.files.get_mut(&real_inode).ok_or(ENOENT)?;
+            file.hardlink -= 1;
+            if file.hardlink <= 0 {
+                self.files.remove(&real_inode);
+            }
         }
+        self.links.remove(&inode);
         self.tree.remove(&inode);
         Ok(())
+    }
+
+    pub fn symlink(
+        &mut self,
+        parent: Ino,
+        link_name: &OsStr,
+        target: &Path,
+    ) -> Result<&FileAttr, c_int> {
+        let name_str: &str = link_name.to_str().unwrap();
+        let inode: Ino = self.next_inode();
+        let parent_inode: &mut Node = self.tree.get_mut(&parent).ok_or(ENOENT)?;
+        match parent_inode.children.get_mut(name_str) {
+            Some(inode) => self.attrs.get(&inode).ok_or(EINVAL),
+            None => {
+                let ts: SystemTime = SystemTime::now();
+                self.attrs.insert(
+                    inode,
+                    FileAttr {
+                        ino: inode,
+                        size: target.to_str().unwrap().len() as u64,
+                        blocks: 0,
+                        atime: ts,
+                        mtime: ts,
+                        ctime: ts,
+                        crtime: ts,
+                        kind: FileType::Symlink,
+                        perm: 0o777,
+                        nlink: 0,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        blksize: 0,
+                        flags: 0,
+                    },
+                );
+                self.files.insert(
+                    inode,
+                    MemFile::new_data(target.to_str().unwrap().as_bytes().to_vec()),
+                );
+                self.links.insert(inode, inode);
+                parent_inode.children.insert(name_str.to_string(), inode);
+                self.attrs.get(&inode).ok_or(EINVAL)
+            }
+        }
+    }
+
+    pub fn link(
+        &mut self,
+        origin_inode: Ino,
+        new_parent: Ino,
+        new_name: &OsStr,
+    ) -> Result<&FileAttr, c_int> {
+        let name_str: &str = new_name.to_str().unwrap();
+        let inode: Ino = self.next_inode();
+        let parent_inode: &mut Node = self.tree.get_mut(&new_parent).ok_or(ENOENT)?;
+        match parent_inode.children.get_mut(name_str) {
+            Some(inode) => self.attrs.get(&inode).ok_or(EINVAL),
+            None => {
+                let target_inode: &Ino = self.links.get(&origin_inode).ok_or(ENOENT)?;
+                let target_file: &mut MemFile = self.files.get_mut(&target_inode).ok_or(ENOENT)?;
+                let ts: SystemTime = SystemTime::now();
+                self.attrs.insert(
+                    inode,
+                    FileAttr {
+                        ino: inode,
+                        size: target_file.size() as u64,
+                        blocks: 0,
+                        atime: ts,
+                        mtime: ts,
+                        ctime: ts,
+                        crtime: ts,
+                        kind: FileType::RegularFile,
+                        perm: 0o777,
+                        nlink: 0,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        blksize: 0,
+                        flags: 0,
+                    },
+                );
+                parent_inode.children.insert(name_str.to_string(), inode);
+                target_file.hardlink += 1;
+                self.links.insert(inode, *target_inode);
+                self.attrs.get(&inode).ok_or(EINVAL)
+            }
+        }
     }
 
     pub fn create(&mut self, parent: Ino, name: &OsStr) -> Result<&FileAttr, c_int> {
@@ -261,9 +425,9 @@ impl MemFS {
                         flags: 0,
                     },
                 );
-                self.files.insert(inode, Vec::new());
+                self.files.insert(inode, MemFile::new());
+                self.links.insert(inode, inode);
                 parent_inode.children.insert(name_str.to_string(), inode);
-                self.tree.insert(inode, Node::new(parent));
                 self.attrs.get(&inode).ok_or(EINVAL)
             }
         }
@@ -272,38 +436,40 @@ impl MemFS {
     pub fn write(&mut self, inode: Ino, offset: i64, data: &[u8]) -> Result<u64, c_int> {
         let ts: SystemTime = SystemTime::now();
         let attr: &mut FileAttr = self.attrs.get_mut(&inode).ok_or(EINVAL)?;
-        let memfile: &mut Vec<u8> = self.files.get_mut(&inode).ok_or(ENOENT)?;
+        let real_inode: &Ino = self.links.get(&inode).ok_or(ENOENT)?;
+        let memfile: &mut MemFile = self.files.get_mut(&real_inode).ok_or(ENOENT)?;
 
-        if memfile.len() <= offset as usize {
-            memfile.extend(iter::repeat(0).take(offset as usize - memfile.len()));
-        }
-
-        if offset as usize + data.len() > memfile.len() {
-            memfile.splice(offset as usize.., data.iter().cloned());
-        } else {
-            memfile.splice(
-                offset as usize..offset as usize + data.len(),
-                data.iter().cloned(),
-            );
-        }
+        memfile.update(data, offset as usize);
 
         attr.atime = ts;
         attr.mtime = ts;
-        attr.size = memfile.len() as u64;
+        attr.size = memfile.size() as u64;
         Ok(data.len() as u64)
     }
 
     pub fn read(&mut self, inode: Ino, offset: i64, size: u32) -> Result<&[u8], c_int> {
         let attr: &mut FileAttr = self.attrs.get_mut(&inode).ok_or(EINVAL)?;
-        let memfile: &mut Vec<u8> = self.files.get_mut(&inode).ok_or(ENOENT)?;
+        let real_inode: &Ino = self.links.get(&inode).ok_or(ENOENT)?;
+        let memfile: &mut MemFile = self.files.get_mut(&real_inode).ok_or(ENOENT)?;
         attr.atime = SystemTime::now();
-        if memfile.len() < offset as usize {
+        if memfile.size() < offset as usize {
             return Err(EINVAL);
-        } else if memfile.len() < offset as usize + size as usize {
-            Ok(&memfile[offset as usize..])
+        } else if memfile.size() < offset as usize + size as usize {
+            Ok(&memfile.data[offset as usize..])
         } else {
-            Ok(&memfile[offset as usize..(offset as usize + size as usize)])
+            Ok(&memfile.data[offset as usize..(offset as usize + size as usize)])
         }
+    }
+
+    pub fn readlink(&mut self, inode: Ino) -> Result<&[u8], c_int> {
+        let attr: &mut FileAttr = self.attrs.get_mut(&inode).ok_or(EINVAL)?;
+        attr.atime = SystemTime::now();
+        let target_inode: &Ino = self.links.get(&inode).ok_or(ENOENT)?;
+        let real_inode: &Ino = self.links.get(&target_inode).ok_or(ENOENT)?;
+        //get real_path
+
+        let memfile: &mut MemFile = self.files.get_mut(&real_inode).ok_or(ENOENT)?;
+        Ok(&memfile.data)
     }
 
     pub fn rename(
@@ -357,6 +523,13 @@ impl Default for MemFS {
 }
 
 impl Filesystem for MemFS {
+    fn lookup(&mut self, _: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        match self.lookup(parent, name) {
+            Ok(attr) => reply.entry(&Duration::new(0, 0), attr, 0),
+            Err(e) => reply.error(e),
+        }
+    }
+
     fn getattr(&mut self, _: &Request, inode: u64, reply: ReplyAttr) {
         match self.get(inode) {
             Ok(attr) => reply.attr(&Duration::new(0, 0), attr),
@@ -388,28 +561,9 @@ impl Filesystem for MemFS {
         };
     }
 
-    fn readdir(&mut self, _: &Request, inode: u64, _: u64, offset: i64, mut reply: ReplyDirectory) {
-        match self.readdir(inode, offset) {
-            Ok(entries) => {
-                for (i, entry) in entries.into_iter().enumerate() {
-                    let _ = reply.add(entry.0, i as i64, entry.1, entry.2);
-                }
-                reply.ok();
-            }
-            Err(e) => reply.error(e),
-        };
-    }
-
-    fn lookup(&mut self, _: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        match self.lookup(parent, name) {
-            Ok(attr) => reply.entry(&Duration::new(0, 0), attr, 0),
-            Err(e) => reply.error(e),
-        }
-    }
-
-    fn rmdir(&mut self, _: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.rmdir(parent, name) {
-            Ok(()) => reply.ok(),
+    fn readlink(&mut self, _: &Request, inode: u64, reply: ReplyData) {
+        match self.readlink(inode) {
+            Ok(slice) => reply.data(slice),
             Err(e) => reply.error(e),
         }
     }
@@ -421,10 +575,6 @@ impl Filesystem for MemFS {
         }
     }
 
-    fn open(&mut self, _: &Request, _: u64, _: i32, reply: ReplyOpen) {
-        reply.opened(0, 0);
-    }
-
     fn unlink(&mut self, _: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match self.unlink(parent, name) {
             Ok(()) => reply.ok(),
@@ -432,18 +582,74 @@ impl Filesystem for MemFS {
         }
     }
 
-    fn create(
+    fn rmdir(&mut self, _: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match self.rmdir(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn symlink(
+        &mut self,
+        _: &Request<'_>,
+        parent: u64,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        match self.symlink(parent, link_name, target) {
+            Ok(attr) => reply.entry(&Duration::new(0, 0), &attr, 0),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn rename(
         &mut self,
         _: &Request,
         parent: u64,
         name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
         _: u32,
-        _: u32,
-        _: i32,
-        reply: ReplyCreate,
+        reply: ReplyEmpty,
     ) {
-        match self.create(parent, name) {
-            Ok(attr) => reply.created(&Duration::new(0, 0), attr, 0, 0, 0),
+        match self.rename(parent, name, new_parent, new_name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn link(
+        &mut self,
+        _: &Request,
+        inode: u64,
+        new_parent: u64,
+        new_name: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        match self.link(inode, new_parent, new_name) {
+            Ok(attr) => reply.entry(&Duration::new(0, 0), &attr, 0),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn open(&mut self, _: &Request, _: u64, _: i32, reply: ReplyOpen) {
+        reply.opened(0, 0);
+    }
+
+    fn read(
+        &mut self,
+        _: &Request,
+        inode: u64,
+        _: u64,
+        offset: i64,
+        size: u32,
+        _: i32,
+        _: Option<u64>,
+        reply: ReplyData,
+    ) {
+        match self.read(inode, offset, size) {
+            Ok(slice) => reply.data(slice),
             Err(e) => reply.error(e),
         }
     }
@@ -466,37 +672,16 @@ impl Filesystem for MemFS {
         }
     }
 
-    fn read(
-        &mut self,
-        _: &Request,
-        inode: u64,
-        _: u64,
-        offset: i64,
-        size: u32,
-        _: i32,
-        _: Option<u64>,
-        reply: ReplyData,
-    ) {
-        match self.read(inode, offset, size) {
-            Ok(slice) => reply.data(slice),
+    fn readdir(&mut self, _: &Request, inode: u64, _: u64, offset: i64, mut reply: ReplyDirectory) {
+        match self.readdir(inode, offset) {
+            Ok(entries) => {
+                for (i, entry) in entries.into_iter().enumerate() {
+                    let _ = reply.add(entry.0, i as i64, entry.1, entry.2);
+                }
+                reply.ok();
+            }
             Err(e) => reply.error(e),
-        }
-    }
-
-    fn rename(
-        &mut self,
-        _: &Request,
-        parent: u64,
-        name: &OsStr,
-        new_parent: u64,
-        new_name: &OsStr,
-        _: u32,
-        reply: ReplyEmpty,
-    ) {
-        match self.rename(parent, name, new_parent, new_name) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
+        };
     }
 
     fn statfs(&mut self, _: &Request, inode: u64, reply: ReplyStatfs) {
@@ -505,6 +690,22 @@ impl Filesystem for MemFS {
 
         match self.size(inode) {
             Ok((size, file)) => reply.statfs(size, 0, sys.free_memory(), file, 0, 1, 0, 0),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn create(
+        &mut self,
+        _: &Request,
+        parent: u64,
+        name: &OsStr,
+        _: u32,
+        _: u32,
+        _: i32,
+        reply: ReplyCreate,
+    ) {
+        match self.create(parent, name) {
+            Ok(attr) => reply.created(&Duration::new(0, 0), attr, 0, 0, 0),
             Err(e) => reply.error(e),
         }
     }
