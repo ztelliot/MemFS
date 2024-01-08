@@ -2,6 +2,13 @@
 
 基于 FUSE 实现的简易内存文件系统
 
+## 使用
+
+```bash
+cargo b
+target/debug/memfs <mountpoint>
+```
+
 ## 实现的 FUSE 接口
 
 - lookup
